@@ -41,6 +41,16 @@ MIGRATION_MC_MIN = 25_000   # ~$25k+ = likely graduated
 PUMPFUN_RPS    = 2     # 2 requests/sec = 120/min (conservative, real limit ~5/sec)
 DEXSCREENER_RPS = 4    # 4 requests/sec = 240/min (limit is 300/min, leave headroom)
 
+# pump.fun changed their API URL — try each in order, cache the working one
+PF_BASE_URLS = [
+    "https://frontend-api-v3.pump.fun",
+    "https://frontend-api-v2.pump.fun",
+    "https://frontend-api.pump.fun",
+    "https://client-api-2.pump.fun",
+    "https://pump.fun/api",
+]
+_pf_working_base = None   # discovered at runtime
+
 OUTPUT_PATH = "data/tokens.json"
 
 # ─── Shared state (thread-safe via locks) ─────────────────────────────────────
@@ -312,10 +322,25 @@ def pumpfun_thread():
     sort_idx = 0
     current_sort, current_order = sorts[sort_idx]
 
+    # Discover working pump.fun base URL once
+    global _pf_working_base
+    if _pf_working_base is None:
+        print("  [PF] Detecting working pump.fun API URL...")
+        for base_url in PF_BASE_URLS:
+            test = get(pf_session, f"{base_url}/coins",
+                       params={"limit": 1, "offset": 0, "includeNsfw": "false"})
+            if test is not None:
+                _pf_working_base = base_url
+                print(f"  [PF] ✓ Working URL: {base_url}")
+                break
+        if _pf_working_base is None:
+            print("  [PF] ✗ All pump.fun URLs failed — thread exiting")
+            return
+
     while not targets_met() and pages < MAX_PUMPFUN_PAGES:
         pf_limiter.wait()
 
-        data = get(pf_session, "https://pump.fun/api/coins", params={
+        data = get(pf_session, f"{_pf_working_base}/coins", params={
             "sort":        current_sort,
             "order":       current_order,
             "limit":       50,
@@ -327,10 +352,19 @@ def pumpfun_thread():
         pages += 1
 
         if not data:
-            time.sleep(3)
-            offset = 0
-            sort_idx = (sort_idx + 1) % len(sorts)
-            current_sort, current_order = sorts[sort_idx]
+            # Maybe the URL broke mid-run, re-detect
+            _pf_working_base = None
+            time.sleep(5)
+            for base_url in PF_BASE_URLS:
+                test = get(pf_session, f"{base_url}/coins",
+                           params={"limit": 1, "offset": 0, "includeNsfw": "false"})
+                if test is not None:
+                    _pf_working_base = base_url
+                    print(f"  [PF] ↻ Re-detected URL: {base_url}")
+                    break
+            if _pf_working_base is None:
+                print("  [PF] ✗ pump.fun completely unreachable — thread exiting")
+                return
             continue
 
         items = data if isinstance(data, list) else data.get("coins", data.get("data", []))
